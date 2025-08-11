@@ -8,7 +8,7 @@ GraphQL supports the notion of *interfaces*, collections of fields and their arg
    Read about :spec:`interfaces <Interfaces>`.
 
 
-To keep things simple, interfaces can not extend other interfaces.
+Interfaces can implement other interfaces, allowing for interface inheritance and field composition.
 Likewise, objects can implement multiple interfaces, but can not extend other objects.
 
 Interfaces are valid types, they can be specified as the return type of a query, mutation,

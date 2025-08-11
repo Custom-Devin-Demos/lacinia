@@ -354,7 +354,8 @@
 ;; Here we'd prefer a version of ::fields where :resolve was not defined.
 (s/def ::interface (s/keys :opt-un [::description
                                     ::directives
-                                    ::fields]))
+                                    ::fields
+                                    ::implements]))
 ;; A list of keyword identifying objects that are part of a union.
 (s/def ::members (s/and (s/coll-of ::type-name)
                    seq))
@@ -1558,12 +1559,61 @@
         map->Type
         compile-directives)))
 
+(defn ^:private merge-interface-fields
+  "Merges fields from parent interfaces into the child interface."
+  [schema interface implements]
+  (if (empty? implements)
+    interface
+    (let [parent-fields (reduce (fn [acc parent-name]
+                                  (let [parent-interface (get schema parent-name)]
+                                    (merge acc (:fields parent-interface))))
+                                {}
+                                implements)
+          merged-fields (merge parent-fields (:fields interface))]
+      (assoc interface :fields merged-fields))))
+
+(defn ^:private detect-interface-inheritance-cycles
+  "Detects cycles in interface inheritance chains."
+  [schema interface implements]
+  (letfn [(has-cycle? [visited current-name]
+            (if (contains? visited current-name)
+              true
+              (let [current-interface (get schema current-name)
+                    parent-implements (:implements current-interface)]
+                (some #(has-cycle? (conj visited current-name) %) parent-implements))))]
+    (when (some #(has-cycle? #{} %) implements)
+      (throw (ex-info (format "Interface %s has a circular inheritance dependency."
+                              (-> interface :type-name q))
+                      {:interface interface})))))
+
+(defn ^:private validate-interface-inheritance
+  "Validates interface inheritance chain and detects cycles."
+  [schema interface implements]
+  (doseq [parent-name implements
+          :let [parent-interface (get schema parent-name)]]
+    (when-not parent-interface
+      (throw (ex-info (format "Interface %s extends interface %s, which does not exist."
+                              (-> interface :type-name q)
+                              (q parent-name))
+                      {:interface interface
+                       :schema-types (type-map schema)})))
+    (when-not (= :interface (:category parent-interface))
+      (throw (ex-info (format "Interface %s implements type %s, which is not an interface."
+                              (-> interface :type-name q)
+                              (q parent-name))
+                      {:interface interface
+                       :schema-types (type-map schema)}))))
+  (detect-interface-inheritance-cycles schema interface implements))
+
 (defmethod compile-type :interface
   [interface schema]
-  (->> interface
-    map->Interface
-    compile-directives
-    (compile-fields schema)))
+  (let [implements (->> interface :implements (map as-keyword) set)]
+    (validate-interface-inheritance schema interface implements)
+    (let [interface-with-merged-fields (merge-interface-fields schema interface implements)]
+      (->> interface-with-merged-fields
+           map->Interface
+           compile-directives
+           (compile-fields schema)))))
 
 (defn ^:private extract-type-name
   "Navigates a type map down to the root kind and returns the type name."
@@ -1693,6 +1743,35 @@
                       :directive-type directive-type
                       :allowed-locations (:locations directive)}))))))))
 
+(defn ^:private prepare-and-validate-interface-inheritance
+  "Validates interface inheritance relationships and field compatibility."
+  [schema interface-def]
+  (doseq [parent-name (:implements interface-def)
+          :let [parent-interface (get schema parent-name)
+                interface-name (:type-name interface-def)]
+          [field-name parent-field] (:fields parent-interface)
+          :let [interface-field (get-nested interface-def [:fields field-name])
+                parent-field-args (:args parent-field)
+                interface-field-args (:args interface-field)]]
+
+    (when interface-field
+      (when-not (is-assignable? schema parent-field interface-field)
+        (throw (ex-info "Interface field is not compatible with parent interface type."
+                        {:parent-interface-name parent-name
+                         :field-name (:qualified-name interface-field)})))
+
+      (when parent-field-args
+        (doseq [parent-field-arg parent-field-args
+                :let [[arg-name parent-arg-def] parent-field-arg
+                      interface-field-arg-def (get interface-field-args arg-name)]]
+
+          (when interface-field-arg-def
+            (when-not (is-assignable? schema parent-arg-def interface-field-arg-def)
+              (throw (ex-info "Interface field's argument is not compatible with parent interface's argument type."
+                              {:parent-interface-name parent-name
+                               :argument-name (:qualified-name interface-field-arg-def)}))))))))
+  interface-def)
+
 (defn ^:private prepare-and-validate-interfaces
   "Invoked after compilation to add a :members set identifying which concrete types implement
   the interface.  Peforms final verification of types in fields and field arguments."
@@ -1702,6 +1781,7 @@
       (fn [interface]
         (verify-fields-and-args schema interface)
         (validate-directives-in-def schema interface :interface)
+        (prepare-and-validate-interface-inheritance schema interface)
         (let [interface-name (:type-name interface)
               implementors (->> objects
                                 (filter #(-> % :implements interface-name))
