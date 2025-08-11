@@ -53,7 +53,7 @@
 (defn ^:private resolve-interfaces
   [context _ object]
   (let [{:keys [::category ::type-def]} object]
-    (when (= :object category)
+    (when (#{:object :interface} category)
       (let [interfaces (-> type-def :implements sort seq)
             schema (get context constants/schema-key)]
         (map #(type-name->schema-type schema %)
